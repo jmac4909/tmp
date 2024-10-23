@@ -1,0 +1,330 @@
+# cf_utils.py
+
+import subprocess
+import sys
+import os
+
+def get_cf_apps():
+    """
+    Retrieves the list of app names from all orgs and spaces in Cloud Foundry.
+    """
+    try:
+        # Set the HOMEDRIVE environment variable to 'C:'
+        os.environ['HOMEDRIVE'] = 'C:'
+
+        # Get the list of orgs
+        orgs_result = subprocess.run(['cf', 'orgs'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if orgs_result.returncode != 0:
+            print(f"Error retrieving orgs: {orgs_result.stderr}")
+            sys.exit(1)
+
+        orgs_output = orgs_result.stdout
+        org_names = []
+        lines = orgs_output.strip().split('\n')
+
+        # Adjust index based on actual output
+        for line in lines[3:]:
+            org_name = line.strip()
+            if org_name:
+                org_names.append(org_name)
+
+        all_app_names = []
+
+        for org in org_names:
+            # Target the org
+            target_org_result = subprocess.run(['cf', 'target', '-o', org], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if target_org_result.returncode != 0:
+                print(f"Error targeting org {org}: {target_org_result.stderr}")
+                continue  # Skip to the next org
+
+            # Get the list of spaces in this org
+            spaces_result = subprocess.run(['cf', 'spaces'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if spaces_result.returncode != 0:
+                print(f"Error retrieving spaces in org {org}: {spaces_result.stderr}")
+                continue  # Skip to the next org
+
+            spaces_output = spaces_result.stdout
+            space_names = []
+            lines = spaces_output.strip().split('\n')
+
+            for line in lines[3:]:
+                space_name = line.strip()
+                if space_name:
+                    space_names.append(space_name)
+
+            for space in space_names:
+                # Target the org and space
+                target_space_result = subprocess.run(['cf', 'target', '-o', org, '-s', space], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if target_space_result.returncode != 0:
+                    print(f"Error targeting space {space} in org {org}: {target_space_result.stderr}")
+                    continue  # Skip to the next space
+
+                # Get the apps in this space
+                apps_result = subprocess.run(['cf', 'apps'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if apps_result.returncode != 0:
+                    print(f"Error retrieving apps in org {org}, space {space}: {apps_result.stderr}")
+                    continue  # Skip to the next space
+
+                apps_output = apps_result.stdout
+                lines = apps_output.strip().split('\n')
+
+                for line in lines[4:]:
+                    if line.strip():
+                        app_name = line.split()[0]
+                        all_app_names.append(app_name)
+
+        return all_app_names
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        sys.exit(1)
+
+# app_utils.py
+
+import json
+import os
+import urllib.request
+import urllib.parse
+
+APPS_FILE = 'apps.json'
+
+def load_apps():
+    """
+    Loads the apps data from the JSON file.
+    """
+    if os.path.exists(APPS_FILE):
+        with open(APPS_FILE, 'r') as f:
+            return json.load(f)
+    else:
+        return {}
+
+def save_apps(apps_data):
+    """
+    Saves the apps data to the JSON file.
+    """
+    with open(APPS_FILE, 'w') as f:
+        json.dump(apps_data, f, indent=4)
+
+def update_apps(app_names, private_token=None):
+    """
+    Updates the apps data by searching for the app in GitLab and storing the project ID.
+    """
+    apps_data = load_apps()
+    for app_name in app_names:
+        if app_name not in apps_data:
+            # Use the GitLab Search API to find the project
+            project_id = search_project(app_name, private_token)
+            if project_id:
+                apps_data[app_name] = {'project_id': project_id}
+            else:
+                print(f"Project for app '{app_name}' not found in GitLab.")
+    save_apps(apps_data)
+
+def search_project(app_name, private_token=None):
+    """
+    Searches for a project in GitLab by app name and returns the project ID.
+    If multiple projects are found, prompts the user to select one or skip.
+    """
+    search_url = f"https://gitlab.com/api/v4/search?scope=projects&search={urllib.parse.quote(app_name)}"
+    headers = {
+        'Accept': 'application/json',
+    }
+    if private_token:
+        headers['PRIVATE-TOKEN'] = private_token
+    else:
+        print("Warning: No private token provided. Access to private projects will fail.")
+
+    request = urllib.request.Request(search_url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(request) as response:
+            if response.status != 200:
+                print(f"Error searching for project '{app_name}': {response.status}")
+                return None
+
+            projects = json.loads(response.read().decode())
+            # Collect all exact matches
+            exact_matches = [project for project in projects if project['name'] == app_name]
+            if not exact_matches:
+                print(f"No exact match found for '{app_name}'")
+                return None
+            elif len(exact_matches) == 1:
+                project = exact_matches[0]
+                print(f"Found project '{app_name}' with ID {project['id']}")
+                return project['id']
+            else:
+                print(f"Multiple projects found for '{app_name}':")
+                for idx, project in enumerate(exact_matches):
+                    print(f"{idx + 1}: {project['path_with_namespace']} (ID: {project['id']})")
+                selection = input("Enter the number of the project to use, or 's' to skip: ").strip()
+                if selection.lower() == 's':
+                    print(f"Skipping app '{app_name}'")
+                    return None
+                try:
+                    index = int(selection) - 1
+                    if 0 <= index < len(exact_matches):
+                        selected_project = exact_matches[index]
+                        print(f"Selected project '{selected_project['path_with_namespace']}' with ID {selected_project['id']}")
+                        return selected_project['id']
+                    else:
+                        print("Invalid selection. Skipping.")
+                        return None
+                except ValueError:
+                    print("Invalid input. Skipping.")
+                    return None
+    except urllib.error.HTTPError as e:
+        print(f"HTTP Error: {e.code} {e.reason}")
+        print(f"Error searching for project '{app_name}': {e}")
+        return None
+    except Exception as e:
+        print(f"Error searching for project '{app_name}': {e}")
+        return None
+
+# dependency_parser.py
+
+import urllib.request
+import urllib.parse
+import json
+
+def fetch_dependency_files(app_name, project_id, target_dir='dependencies', private_token=None):
+    """
+    Fetches dependency files from the repository using the GitLab API.
+    """
+    dependencies = set()
+
+    api_url = f"https://gitlab.com/api/v4/projects/{project_id}"
+
+    # Prepare the request headers
+    headers = {
+        'Accept': 'application/json',
+    }
+    if private_token:
+        headers['PRIVATE-TOKEN'] = private_token
+    else:
+        print("Warning: No private token provided. Access to private repositories will fail.")
+
+    # Get a list of files in the target directory
+    tree_url = f"{api_url}/repository/tree?path={urllib.parse.quote(target_dir)}&recursive=true"
+    request = urllib.request.Request(tree_url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(request) as response:
+            if response.status != 200:
+                print(f"Error fetching file list for '{app_name}': {response.status}")
+                return dependencies
+
+            files = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"HTTP Error: {e.code} {e.reason}")
+        print(f"Error fetching file list for '{app_name}': {e}")
+        return dependencies
+    except Exception as e:
+        print(f"Error fetching file list for '{app_name}': {e}")
+        return dependencies
+
+    for file_info in files:
+        if file_info['type'] == 'blob':
+            file_path = file_info['path']
+            # Fetch the file content
+            file_url = f"{api_url}/repository/files/{urllib.parse.quote(file_path, safe='')}/raw?ref=master"  # Adjust branch if necessary
+            file_request = urllib.request.Request(file_url, headers=headers)
+            try:
+                with urllib.request.urlopen(file_request) as file_response:
+                    if file_response.status == 200:
+                        file_content = file_response.read().decode()
+                        deps = parse_dependency_content(file_content)
+                        dependencies.update(deps)
+                    else:
+                        print(f"Error fetching file {file_path}: {file_response.status}")
+            except Exception as e:
+                print(f"Error fetching file {file_path}: {e}")
+
+    return dependencies
+
+def parse_dependency_content(file_content):
+    """
+    Parses the content of a dependency file and extracts dependencies.
+    """
+    deps = set()
+    for line in file_content.splitlines():
+        dep = line.strip()
+        if dep:
+            deps.add(dep)
+    return deps
+
+# dependency_utils.py
+
+import json
+import os
+
+DEPS_FILE = 'dependencies.json'
+
+def load_dependencies():
+    """
+    Loads the dependencies data from the JSON file.
+    """
+    if os.path.exists(DEPS_FILE):
+        with open(DEPS_FILE, 'r') as f:
+            return json.load(f)
+    else:
+        return {}
+
+def save_dependencies(deps_data):
+    """
+    Saves the dependencies data to the JSON file.
+    """
+    with open(DEPS_FILE, 'w') as f:
+        json.dump(deps_data, f, indent=4)
+
+def update_dependencies(app_name, dependencies):
+    """
+    Updates the dependencies data by adding new dependencies.
+    """
+    deps_data = load_dependencies()
+    existing_deps = set(deps_data.get(app_name, []))
+    new_deps = dependencies - existing_deps
+    if new_deps:
+        print(f"New dependencies found for app '{app_name}': {', '.join(new_deps)}")
+    existing_deps.update(new_deps)
+    deps_data[app_name] = list(existing_deps)
+    save_dependencies(deps_data)
+
+# main.py
+
+from cf_utils import get_cf_apps
+from app_utils import update_apps, load_apps
+from dependency_parser import fetch_dependency_files
+from dependency_utils import update_dependencies
+import os
+
+def main():
+    # Step 1: Get app names from Cloud Foundry
+    app_names = get_cf_apps()
+    if not app_names:
+        print("No apps found.")
+        return
+
+    # Remove duplicates if any
+    app_names = list(set(app_names))
+
+    # Add your GitLab personal access token if required
+    private_token = os.getenv('GITLAB_PRIVATE_TOKEN')  # Replace with your token or set to None if not needed
+
+    # Step 2: Update apps in the apps.json file
+    update_apps(app_names, private_token=private_token)
+    apps_data = load_apps()
+
+    # Step 3: Process each app
+    for app_name, app_info in apps_data.items():
+        project_id = app_info.get('project_id')
+        if not project_id:
+            print(f"No project ID found for app '{app_name}'. Skipping.")
+            continue
+
+        # Fetch and parse dependency files directly from GitLab
+        dependencies = fetch_dependency_files(app_name, project_id, private_token=private_token)
+
+        # Update dependencies in the dependencies.json file
+        update_dependencies(app_name, dependencies)
+
+if __name__ == "__main__":
+    main()
